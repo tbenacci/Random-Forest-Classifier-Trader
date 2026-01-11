@@ -1,0 +1,745 @@
+---
+title: "Quantitative Trading System Analysis"
+subtitle: "Random Forest-Based Holiday Return Prediction Model"
+author: "Thomas Benacci"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    code_folding: hide
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center",
+  dpi = 150
+)
+```
+
+---
+
+# Environment Setup
+
+## Required Libraries
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(pbapply)
+library(data.table)
+library(scales)
+library(knitr)
+library(kableExtra)
+
+# Define a consistent color palette for visualizations
+palette_main <- c(
+
+  "RF1" = "#2E86AB",
+  "1/N Stock Universe" = "#A23B72",
+  "SPY Benchmark" = "#F18F01",
+  "Top_5" = "#C73E1D",
+  "Top_10" = "#2E86AB",
+  "Top_20" = "#3B9A74",
+  "Top_50" = "#7B68EE",
+  "Top_100" = "#FF6B6B",
+  "Top_250" = "#4ECDC4"
+)
+
+# Professional theme for ggplot
+theme_trading <- function() {
+
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0),
+      plot.subtitle = element_text(color = "gray40", size = 11, hjust = 0),
+      plot.caption = element_text(color = "gray50", size = 9, hjust = 1),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "gray90"),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold", size = 10),
+      axis.title = element_text(face = "bold", size = 10),
+      strip.text = element_text(face = "bold")
+    )
+}
+```
+
+---
+
+# Data Import and Preprocessing
+
+## Load Feature Data and Model Predictions
+
+```{r data_import}
+# Load feature dataset containing stock characteristics
+feature_data <- fread("feature_data_holiday_20251112.csv", data.table = FALSE) %>%
+  distinct(datadate, tic, .keep_all = TRUE) %>%
+  mutate(model = "RF1")
+
+# Load Random Forest model predictions
+results_data <- fread("rf_holiday_results_20251112_entropy.csv", data.table = FALSE) %>%
+  select(datadate, tic, prediction)
+
+# Merge datasets and standardize column names
+data <- merge(results_data, feature_data, all.x = TRUE) %>%
+  filter(datadate <= "2025-01-01") %>%
+  rename(
+    spy_return = spy_holiday_return,
+    return = holiday_return
+  )
+
+# Clean up intermediate objects
+rm(feature_data, results_data)
+
+cat("Dataset dimensions:", nrow(data), "observations x", ncol(data), "variables\n")
+cat("Date range:", as.character(min(data$datadate)), "to", as.character(max(data$datadate)), "\n")
+cat("Unique tickers:", length(unique(data$tic)), "\n")
+```
+
+## Load Federal Funds Rate Data
+
+```{r fedfunds}
+fedfunds <- fread("FEDFUNDS.csv", data.table = FALSE) %>%
+  mutate(
+    FEDFUNDS = FEDFUNDS / 100,
+    rf_weekly = (1 + FEDFUNDS)^(1/52) - 1,
+    rf_daily = (1 + FEDFUNDS)^(1/252) - 1
+  )
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Excess Return Distribution
+
+Excess returns are calculated as the difference between individual stock returns and the SPY benchmark return for each period.
+
+```{r excess_returns_analysis}
+excess_returns <- data$return - data$spy_return
+
+# Summary statistics
+excess_summary <- data.frame(
+  Statistic = c("Mean", "Median", "Std Dev", "Min", "Max", "Skewness", "Kurtosis"),
+  Value = c(
+    round(mean(excess_returns, na.rm = TRUE), 4),
+    round(median(excess_returns, na.rm = TRUE), 4),
+    round(sd(excess_returns, na.rm = TRUE), 4),
+    round(min(excess_returns, na.rm = TRUE), 4),
+    round(max(excess_returns, na.rm = TRUE), 4),
+    round(moments::skewness(excess_returns, na.rm = TRUE), 4),
+    round(moments::kurtosis(excess_returns, na.rm = TRUE), 4)
+  )
+)
+
+kable(excess_summary, caption = "Excess Returns Summary Statistics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r excess_returns_plot, fig.height=5}
+# Trim extreme values for visualization
+excess_returns_trimmed <- excess_returns[excess_returns > -0.5 & excess_returns < 0.5]
+
+ggplot(data.frame(excess_return = excess_returns_trimmed), aes(x = excess_return)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 50, fill = "#2E86AB", color = "white", alpha = 0.8) +
+  geom_density(color = "#C73E1D", linewidth = 1) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  geom_vline(xintercept = mean(excess_returns_trimmed), color = "#F18F01", linewidth = 1) +
+  annotate("text", x = mean(excess_returns_trimmed) + 0.02, y = Inf, 
+           label = paste("Mean:", round(mean(excess_returns_trimmed), 4)), 
+           vjust = 2, hjust = 0, size = 3.5, color = "#F18F01") +
+  labs(
+    title = "Distribution of Excess Returns (Stock vs. SPY)",
+    subtitle = "Trimmed to ±50% for visualization clarity",
+    x = "Excess Return",
+    y = "Density",
+    caption = "Orange line indicates mean excess return"
+  ) +
+  theme_trading() +
+  scale_x_continuous(labels = percent_format())
+```
+
+**Interpretation:** The distribution of excess returns is centered closely around zero, indicating no systematic edge inherent in the betting universe. This is consistent with weak-form market efficiency and reinforces the importance of a robust prediction model.
+
+---
+
+## Target Variable Analysis
+
+The target variable is a binary indicator: 1 if the stock return exceeds the SPY return, 0 otherwise.
+
+```{r target_analysis}
+target_mean <- mean(data$target)
+
+cat("Overall target mean (2004-2024):", round(target_mean, 3), "\n")
+cat("Interpretation: A random selection has a", round(target_mean * 100, 1), 
+    "% probability of beating the benchmark.\n")
+```
+
+```{r target_timeseries, fig.height=5}
+# Calculate mean target by date
+df_target <- data %>%
+  group_by(datadate) %>%
+  summarize(mean_target = mean(target), .groups = "drop") %>%
+  mutate(
+    datadate = as.Date(datadate),
+    rolling_mean = zoo::rollmean(mean_target, k = 12, fill = NA, align = "right")
+  )
+
+ggplot(df_target, aes(x = datadate)) +
+  geom_line(aes(y = mean_target), color = "gray70", alpha = 0.6) +
+  geom_line(aes(y = rolling_mean), color = "#2E86AB", linewidth = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "#C73E1D", linewidth = 0.8) +
+  annotate("rect", xmin = as.Date("2020-01-01"), xmax = max(df_target$datadate), 
+           ymin = -Inf, ymax = Inf, alpha = 0.1, fill = "#F18F01") +
+  labs(
+    title = "Mean Target Variable Over Time",
+    subtitle = "Blue line: 12-week rolling average | Red dashed: 50% baseline | Shaded: Post-2020 period",
+    x = "Date",
+    y = "Mean Target",
+    caption = "Increased dispersion post-2020 suggests regime change in market dynamics"
+  ) +
+  theme_trading() +
+  scale_y_continuous(labels = percent_format())
+```
+
+**Interpretation:** Post-2020, the weekly mean target exhibits significantly higher dispersion compared to earlier periods. This presents two practical challenges: (1) reduced predictability using historical training data due to distribution shift, and (2) indication that the benchmark (SPY) has become increasingly concentrated in fewer securities, reducing its representativeness of the broader market.
+
+---
+
+# Feature Analysis
+
+## Feature Correlation Structure
+
+```{r feature_correlation, fig.height=8, fig.width=10}
+feature_cor_mat <- data %>%
+  select(starts_with("char_")) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(3)
+
+# Convert to long format for ggplot
+cor_long <- as.data.frame(as.table(feature_cor_mat)) %>%
+  rename(Feature1 = Var1, Feature2 = Var2, Correlation = Freq)
+
+ggplot(cor_long, aes(x = Feature1, y = Feature2, fill = Correlation)) +
+  geom_tile(color = "white", linewidth = 0.1) +
+  scale_fill_gradient2(
+    low = "#2E86AB", mid = "white", high = "#C73E1D",
+    midpoint = 0, limits = c(-1, 1),
+    name = "Correlation"
+  ) +
+  labs(
+    title = "Feature Correlation Heatmap",
+    subtitle = "Blue: negative correlation | Red: positive correlation",
+    x = NULL, y = NULL
+  ) +
+  theme_trading() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 7),
+    legend.position = "right"
+  ) +
+  coord_fixed()
+```
+
+**Interpretation:** Fundamental characteristics remain largely uncorrelated with each other and with technical indicators. However, technical characteristics exhibit high inter-correlation, which may introduce multicollinearity concerns in the prediction model.
+
+## Feature-Target Correlations
+
+```{r target_feature_cors, fig.height=7}
+target_feature_cors <- sapply(data[grep("^char_", names(data))], function(x) cor(data$target, x, use = "complete.obs"))
+
+# Create sorted dataframe
+cor_df <- data.frame(
+  Feature = names(target_feature_cors),
+  Correlation = as.numeric(target_feature_cors)
+) %>%
+  arrange(desc(abs(Correlation))) %>%
+  mutate(
+    Feature = factor(Feature, levels = Feature),
+    Direction = ifelse(Correlation > 0, "Positive", "Negative")
+  )
+
+# Top 15 features by absolute correlation
+top_features <- head(cor_df, 15)
+
+ggplot(top_features, aes(x = reorder(Feature, abs(Correlation)), y = Correlation, fill = Direction)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(values = c("Positive" = "#2E86AB", "Negative" = "#C73E1D")) +
+  labs(
+    title = "Top 15 Features by Correlation with Target",
+    subtitle = "Features ranked by absolute correlation magnitude",
+    x = NULL,
+    y = "Correlation with Target",
+    caption = "Technical indicators dominate top predictors, reflecting the short-term trading horizon"
+  ) +
+  theme_trading() +
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray40")
+```
+
+**Interpretation:** Among the top features by absolute correlation with the target, technical indicators (momentum measures, RSI, Bollinger Band metrics) significantly outnumber fundamental factors. This reflects the short-term nature of the trading system despite having a near-equal split between fundamental and technical features. The near-zero correlation of several features suggests potential for dimensionality reduction.
+
+---
+
+# Portfolio Construction and Analysis
+
+## Helper Functions and Parameters
+
+```{r portfolio_params}
+# Core parameters
+sizes <- c(5, 10, 20, 50, 100, 250)
+prob_weighted <- TRUE
+periods_per_year <- 252 / 5  # Weekly trading periods
+
+# Date mapping for year labels
+unique_dates <- unique(data$datadate)
+year_labels <- seq(2009, 2025, length.out = length(unique_dates))
+date_to_year <- setNames(year_labels, unique_dates)
+```
+
+## Feature-Based Portfolio Formation
+
+```{r feature_portfolios}
+feature_list <- names(target_feature_cors)
+
+make_feature_portfolios <- function(feature_name) {
+  cors <- target_feature_cors[feature_name]
+  
+  make_portfolio <- function(n_long) {
+    longs <- data %>%
+      group_by(datadate) %>%
+      {
+        if (cors > 0) {
+          arrange(., desc(.data[[feature_name]]), .by_group = TRUE) %>%
+            slice_head(n = n_long)
+        } else {
+          arrange(., .data[[feature_name]], .by_group = TRUE) %>%
+            slice_head(n = n_long)
+        }
+      } %>%
+      ungroup()
+    
+    port <- longs %>%
+      group_by(datadate) %>%
+      summarise(
+        return = if (prob_weighted)
+          weighted.mean(return, .data[[feature_name]], na.rm = TRUE)
+        else
+          mean(return, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        model = paste0(feature_name, "_Top_", n_long),
+        datadate = as.Date(datadate),
+        year = date_to_year[as.character(datadate)]
+      ) %>%
+      arrange(datadate) %>%
+      group_by(model) %>%
+      mutate(cumulative_return = cumprod(1 + return)) %>%
+      ungroup()
+    
+    return(port)
+  }
+  
+  map_dfr(sizes, make_portfolio)
+}
+
+all_feature_portfolios <- map_dfr(feature_list, make_feature_portfolios)
+
+# Add benchmarks
+equal_weighted_returns <- data %>%
+  group_by(datadate) %>%
+  summarise(return = mean(return), .groups = "drop") %>%
+  mutate(
+    model = "1/N Stock Universe",
+    cumulative_return = cumprod(1 + return),
+    year = date_to_year[as.character(datadate)],
+    datadate = as.Date(datadate)
+  )
+
+spy_portfolio <- data %>%
+  group_by(datadate) %>%
+  summarise(return = mean(spy_return), .groups = "drop") %>%
+  mutate(
+    model = "SPY Benchmark",
+    cumulative_return = cumprod(1 + return),
+    year = date_to_year[as.character(datadate)],
+    datadate = as.Date(datadate)
+  )
+
+all_feature_portfolios <- bind_rows(all_feature_portfolios, equal_weighted_returns, spy_portfolio)
+```
+
+## Feature Portfolio Metrics
+
+```{r feature_metrics}
+spy_returns <- all_feature_portfolios %>%
+  filter(model == "SPY Benchmark") %>%
+  select(datadate, spy_return = return)
+
+portfolios_with_spy <- all_feature_portfolios %>%
+  left_join(spy_returns, by = "datadate")
+
+all_feature_metrics <- portfolios_with_spy %>%
+  group_by(model) %>%
+  summarise(
+    ann_return = mean(return, na.rm = TRUE) * periods_per_year,
+    ann_vol = sd(return, na.rm = TRUE) * sqrt(periods_per_year),
+    return_vol = ann_return / ann_vol,
+    max_drawdown = {
+      cum_ret <- cumprod(1 + return)
+      drawdown <- (cum_ret - cummax(cum_ret)) / cummax(cum_ret)
+      min(drawdown, na.rm = TRUE)
+    },
+    information_ratio = if (unique(model) == "SPY Benchmark") {
+      NA
+    } else {
+      active <- return - spy_return
+      act_ret <- mean(active, na.rm = TRUE) * periods_per_year
+      te <- sd(active, na.rm = TRUE) * sqrt(periods_per_year)
+      act_ret / te
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+# Top performers by Information Ratio
+top_feature_performers <- all_feature_metrics %>%
+  arrange(desc(information_ratio)) %>%
+  head(20)
+
+kable(top_feature_performers, 
+      caption = "Top 20 Feature Portfolios by Information Ratio",
+      col.names = c("Model", "Ann. Return", "Ann. Volatility", "Return/Vol", "Max Drawdown", "Info Ratio")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# RF1 Model Portfolio Analysis
+
+## Portfolio Formation (N = 10)
+
+```{r rf1_portfolio}
+n_long <- 10
+n_short <- 0
+weighing_method <- ifelse(prob_weighted, "Probability-Weighted", "Equal-Weighted")
+
+# Long position selection based on prediction probability
+selected <- data %>%
+  arrange(datadate, desc(prediction)) %>%
+  group_by(datadate, model) %>%
+  slice_head(n = n_long) %>%
+  ungroup()
+
+# Calculate portfolio returns
+portfolios <- selected %>%
+  group_by(datadate, model) %>%
+  summarise(
+    return = if (prob_weighted) weighted.mean(return, prediction) else mean(return),
+    .groups = "drop"
+  ) %>%
+  group_by(model) %>%
+  arrange(datadate) %>%
+  mutate(
+    cumulative_return = cumprod(1 + return),
+    datadate = as.Date(datadate)
+  ) %>%
+  ungroup() %>%
+  mutate(year = date_to_year[as.character(datadate)])
+
+# Add benchmarks
+equal_weighted_returns <- data %>%
+  group_by(datadate) %>%
+  summarise(return = mean(return), .groups = "drop") %>%
+  mutate(
+    model = "1/N Stock Universe",
+    cumulative_return = cumprod(1 + return),
+    year = date_to_year[as.character(datadate)],
+    datadate = as.Date(datadate)
+  )
+
+spy_portfolio <- data %>%
+  group_by(datadate) %>%
+  summarise(return = mean(spy_return), .groups = "drop") %>%
+  mutate(
+    model = "SPY Benchmark",
+    cumulative_return = cumprod(1 + return),
+    year = date_to_year[as.character(datadate)],
+    datadate = as.Date(datadate)
+  )
+
+portfolios <- bind_rows(portfolios, equal_weighted_returns, spy_portfolio)
+```
+
+## Cumulative Performance Visualization
+
+```{r cumulative_plots, fig.height=10}
+# Linear scale plot
+p1 <- ggplot(portfolios, aes(x = datadate, y = cumulative_return, color = model)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = palette_main) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Cumulative Returns: RF1 vs. Benchmarks",
+    subtitle = paste0(weighing_method, " | N = ", n_long, " positions"),
+    x = "Date",
+    y = "Cumulative Return (Growth of $1)",
+    color = "Portfolio"
+  ) +
+  theme_trading()
+
+# Log scale plot
+p2 <- ggplot(portfolios, aes(x = datadate, y = log(cumulative_return), color = model)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_manual(values = palette_main) +
+  labs(
+    title = "Log Cumulative Returns",
+    subtitle = "Logarithmic scale reveals compound growth rate stability",
+    x = "Date",
+    y = "Log Cumulative Return",
+    color = "Portfolio"
+  ) +
+  theme_trading()
+
+# Combine plots
+gridExtra::grid.arrange(p1, p2, ncol = 1)
+```
+
+**Note:** These plots serve primarily for visual intuition. Using them as definitive arguments for or against strategies is inadvisable due to look-ahead bias concerns. The log cumulative plot may be useful for identifying strategy performance decay over time.
+
+## Performance Metrics Summary
+
+```{r performance_metrics}
+spy_returns <- portfolios %>%
+  filter(model == "SPY Benchmark") %>%
+  select(datadate, spy_return = return)
+
+portfolios_with_spy <- portfolios %>%
+  left_join(spy_returns, by = "datadate")
+
+metrics_by_model <- portfolios_with_spy %>%
+  group_by(model) %>%
+  summarise(
+    `Annualized Return` = mean(return, na.rm = TRUE) * periods_per_year,
+    `Annualized Volatility` = sd(return, na.rm = TRUE) * sqrt(periods_per_year),
+    `Return/Volatility` = `Annualized Return` / `Annualized Volatility`,
+    `Max Drawdown` = {
+      cum_ret <- cumprod(1 + return)
+      drawdown <- (cum_ret - cummax(cum_ret)) / cummax(cum_ret)
+      min(drawdown, na.rm = TRUE)
+    },
+    `Information Ratio` = {
+      if (unique(model) == "SPY Benchmark") {
+        NA_real_
+      } else {
+        active_ret <- return - spy_return
+        mean_active <- mean(active_ret, na.rm = TRUE) * periods_per_year
+        tracking_error <- sd(active_ret, na.rm = TRUE) * sqrt(periods_per_year)
+        ifelse(tracking_error != 0, mean_active / tracking_error, NA_real_)
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+kable(metrics_by_model, caption = "Portfolio Performance Metrics (2009-2024)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(which(metrics_by_model$model == "RF1"), bold = TRUE, background = "#E8F4F8")
+```
+
+**Interpretation:** Between 2009 and 2024, the RF1 trading system (N=10) delivers more than double the annualized return of both the 1/N Universe and SPY benchmark. However, this comes with approximately twice the volatility, resulting in comparable Sharpe-like ratios. The maximum drawdown of nearly 40% (occurring within 12 months) represents significant tail risk that must be considered in capital allocation decisions. An Information Ratio between 0.5 and 1.0 is generally considered good to very good, with values exceeding 1.0 being exceptional.
+
+---
+
+# Portfolio Size Sensitivity Analysis
+
+## Performance Across Different Portfolio Sizes
+
+```{r portfolio_sizes, fig.height=6}
+make_portfolio_size <- function(n_long) {
+  longs <- data %>%
+    arrange(datadate, desc(prediction)) %>%
+    group_by(datadate, model) %>%
+    slice_head(n = n_long) %>%
+    ungroup()
+  
+  port <- longs %>%
+    group_by(datadate, model) %>%
+    summarise(
+      return = if (prob_weighted) weighted.mean(return, prediction) else mean(return),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      model = paste0("Top_", n_long),
+      datadate = as.Date(datadate),
+      year = date_to_year[as.character(datadate)]
+    ) %>%
+    arrange(datadate) %>%
+    group_by(model) %>%
+    mutate(cumulative_return = cumprod(1 + return)) %>%
+    ungroup()
+  
+  return(port)
+}
+
+portfolios_all <- map_dfr(sizes, make_portfolio_size)
+
+# Add benchmarks
+equal_weighted_all <- data %>%
+  group_by(datadate) %>%
+  summarise(return = mean(return), .groups = "drop") %>%
+  mutate(
+    model = "1/N Stock Universe",
+    cumulative_return = cumprod(1 + return),
+    year = date_to_year[as.character(datadate)],
+    datadate = as.Date(datadate)
+  )
+
+spy_all <- data %>%
+  group_by(datadate) %>%
+  summarise(return = mean(spy_return), .groups = "drop") %>%
+  mutate(
+    model = "SPY Benchmark",
+    cumulative_return = cumprod(1 + return),
+    year = date_to_year[as.character(datadate)],
+    datadate = as.Date(datadate)
+  )
+
+portfolios_all <- bind_rows(portfolios_all, equal_weighted_all, spy_all)
+
+# Visualize cumulative returns by portfolio size
+ggplot(portfolios_all, aes(x = datadate, y = cumulative_return, color = model)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = palette_main) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title = "Cumulative Returns by Portfolio Size",
+    subtitle = "RF1 model with varying number of long positions",
+    x = "Date",
+    y = "Cumulative Return (Growth of $1)",
+    color = "Portfolio"
+  ) +
+  theme_trading()
+```
+
+```{r size_metrics}
+spy_returns_all <- portfolios_all %>%
+  filter(model == "SPY Benchmark") %>%
+  select(datadate, spy_return = return)
+
+portfolios_all_spy <- portfolios_all %>%
+  left_join(spy_returns_all, by = "datadate")
+
+metrics_all <- portfolios_all_spy %>%
+  group_by(model) %>%
+  summarise(
+    `Ann. Return` = mean(return, na.rm = TRUE) * periods_per_year,
+    `Ann. Vol` = sd(return, na.rm = TRUE) * sqrt(periods_per_year),
+    `Return/Vol` = `Ann. Return` / `Ann. Vol`,
+    `Max DD` = {
+      cum_ret <- cumprod(1 + return)
+      drawdown <- (cum_ret - cummax(cum_ret)) / cummax(cum_ret)
+      min(drawdown, na.rm = TRUE)
+    },
+    `Info Ratio` = if (unique(model) == "SPY Benchmark") {
+      NA_real_
+    } else {
+      active <- return - spy_return
+      act_ret <- mean(active, na.rm = TRUE) * periods_per_year
+      te <- sd(active, na.rm = TRUE) * sqrt(periods_per_year)
+      act_ret / te
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(., 3))) %>%
+  mutate(
+    n_long = ifelse(grepl("^Top_", model), as.numeric(sub("Top_", "", model)), Inf)
+  ) %>%
+  arrange(n_long) %>%
+  select(-n_long)
+
+kable(metrics_all, caption = "Performance Metrics by Portfolio Size") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+**Interpretation:** All RF1 portfolio configurations exhibit positive Information Ratios relative to SPY, indicating consistent alpha generation across different position sizes. As expected, concentrated portfolios (smaller N) exhibit higher volatility but also higher potential returns, while larger portfolios converge toward benchmark-like characteristics.
+
+---
+
+# Return Distribution Analysis
+
+## RF1 vs. SPY Return Histograms
+
+```{r return_histograms, fig.height=8}
+RF1_returns <- portfolios %>%
+  filter(model == "RF1") %>%
+  select(datadate, return) %>%
+  mutate(Portfolio = "RF1")
+
+SPY_returns <- portfolios %>%
+  filter(model == "SPY Benchmark") %>%
+  select(datadate, return) %>%
+  mutate(Portfolio = "SPY")
+
+combined_returns <- bind_rows(RF1_returns, SPY_returns)
+
+ggplot(combined_returns, aes(x = return, fill = Portfolio)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40, alpha = 0.6, position = "identity") +
+  geom_density(aes(color = Portfolio), linewidth = 1, fill = NA) +
+  facet_wrap(~Portfolio, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("RF1" = "#2E86AB", "SPY" = "#F18F01")) +
+  scale_color_manual(values = c("RF1" = "#2E86AB", "SPY" = "#F18F01")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Weekly Return Distributions: RF1 vs. SPY",
+    subtitle = "RF1 exhibits wider dispersion consistent with higher volatility",
+    x = "Weekly Return",
+    y = "Density"
+  ) +
+  theme_trading() +
+  scale_x_continuous(labels = percent_format()) +
+  theme(legend.position = "none")
+```
+
+---
+
+# Appendix: Data Export
+
+```{r export_data, eval=FALSE}
+# Export returns for external simulation
+RF1_returns_export <- portfolios %>%
+  filter(model == "RF1") %>%
+  select(datadate, return) %>%
+  mutate(datadate = lag(datadate)) %>%
+  drop_na()
+
+SPY_returns_export <- portfolios %>%
+  filter(model == "SPY Benchmark") %>%
+  select(datadate, return) %>%
+  mutate(datadate = lag(datadate)) %>%
+  drop_na()
+
+# Uncomment to save
+# write.csv(RF1_returns_export, "RF1_returns.csv", row.names = FALSE)
+# write.csv(SPY_returns_export, "SPY_returns.csv", row.names = FALSE)
+```
+
+---
+
+<div style="text-align: center; margin-top: 40px; padding: 20px; background-color: #f8f9fa; border-radius: 5px;">
+**Report Generated:** `r format(Sys.time(), '%B %d, %Y at %H:%M')`
+</div>
